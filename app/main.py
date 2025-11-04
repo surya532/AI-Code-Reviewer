@@ -4,8 +4,10 @@ from .db import Base, engine, get_db
 from .models import Review
 from .github import get_pr_files, post_pr_comment
 from .reviewer import review_code_with_llm
+from .rate_limit import check_rate_limit
 import asyncio
 
+# Create all tables
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
@@ -14,6 +16,8 @@ app = FastAPI()
 async def github_webhook(request: Request, db: Session = Depends(get_db)):
     payload = await request.json()
     action = payload.get("action")
+    
+    # Only handle PR opened or updated
     if action not in ["opened", "synchronize"]:
         return {"status": "ignored"}
 
@@ -21,8 +25,20 @@ async def github_webhook(request: Request, db: Session = Depends(get_db)):
     repo_full_name = payload["repository"]["full_name"]
     branch = payload["pull_request"]["head"]["ref"]
 
+    # ---------------------------
+    # Rate-limiting check
+    # ---------------------------
+    try:
+        check_rate_limit(repo_full_name)
+    except Exception as e:
+        return {"status": "rate_limited", "message": str(e)}
+
+    # ---------------------------
+    # Fetch changed files from PR
+    # ---------------------------
     files = await get_pr_files(repo_full_name, pr_number)
     code_snippets = []
+
     for f in files:
         if f["filename"].endswith(".py") and f["status"] != "removed":
             patch = f.get("patch")
@@ -32,8 +48,14 @@ async def github_webhook(request: Request, db: Session = Depends(get_db)):
     if not code_snippets:
         return {"status": "no python files"}
 
+    # ---------------------------
+    # Review code using LLM
+    # ---------------------------
     review_text = review_code_with_llm(code_snippets)
 
+    # ---------------------------
+    # Save review to DB
+    # ---------------------------
     review_entry = Review(
         repo=repo_full_name,
         pr_number=pr_number,
@@ -45,6 +67,9 @@ async def github_webhook(request: Request, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(review_entry)
 
+    # ---------------------------
+    # Post review comment to GitHub
+    # ---------------------------
     asyncio.create_task(post_pr_comment(repo_full_name, pr_number, review_text))
 
     return {"status": "reviewed"}
