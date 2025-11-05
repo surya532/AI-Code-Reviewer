@@ -5,9 +5,9 @@ from .models import Review
 from .github import get_pr_files, post_pr_comment
 from .reviewer import review_code_with_llm
 from .rate_limit import check_rate_limit
+from .language_utils import detect_language, generate_language_prompt
 import asyncio
 
-# Create all tables
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
@@ -16,8 +16,7 @@ app = FastAPI()
 async def github_webhook(request: Request, db: Session = Depends(get_db)):
     payload = await request.json()
     action = payload.get("action")
-    
-    # Only handle PR opened or updated
+
     if action not in ["opened", "synchronize"]:
         return {"status": "ignored"}
 
@@ -25,51 +24,60 @@ async def github_webhook(request: Request, db: Session = Depends(get_db)):
     repo_full_name = payload["repository"]["full_name"]
     branch = payload["pull_request"]["head"]["ref"]
 
-    # ---------------------------
-    # Rate-limiting check
-    # ---------------------------
+    # Rate limit
     try:
         check_rate_limit(repo_full_name)
     except Exception as e:
         return {"status": "rate_limited", "message": str(e)}
 
-    # ---------------------------
-    # Fetch changed files from PR
-    # ---------------------------
+    # Fetch PR files
     files = await get_pr_files(repo_full_name, pr_number)
-    code_snippets = []
+    code_reviews = []
 
     for f in files:
-        if f["filename"].endswith(".py") and f["status"] != "removed":
-            patch = f.get("patch")
-            if patch:
-                code_snippets.append(f"# File: {f['filename']}\n{patch}")
+        filename = f["filename"]
+        if f["status"] == "removed":
+            continue
 
-    if not code_snippets:
-        return {"status": "no python files"}
+        language = detect_language(filename)
+        if language == "unknown":
+            continue
 
-    # ---------------------------
-    # Review code using LLM
-    # ---------------------------
-    review_text = review_code_with_llm(code_snippets)
+        patch = f.get("patch")
+        if not patch:
+            continue
 
-    # ---------------------------
-    # Save review to DB
-    # ---------------------------
+        # Generate language-aware prompt
+        prompt = generate_language_prompt(language, patch)
+
+        # Send prompt to OpenAI for review
+        review_text = review_code_with_llm(prompt)
+
+        code_reviews.append({
+            "file": filename,
+            "language": language,
+            "comments": review_text
+        })
+
+    if not code_reviews:
+        return {"status": "no_supported_files"}
+
+    # Save to DB
     review_entry = Review(
         repo=repo_full_name,
         pr_number=pr_number,
         branch=branch,
         status="completed",
-        review={"comments": review_text}
+        review={"comments": code_reviews}
     )
     db.add(review_entry)
     db.commit()
     db.refresh(review_entry)
 
-    # ---------------------------
-    # Post review comment to GitHub
-    # ---------------------------
-    asyncio.create_task(post_pr_comment(repo_full_name, pr_number, review_text))
+    # Post summary comment
+    summary = "\n\n".join(
+        [f"### {r['file']} ({r['language']})\n{r['comments']}" for r in code_reviews]
+    )
+    asyncio.create_task(post_pr_comment(repo_full_name, pr_number, summary))
 
-    return {"status": "reviewed"}
+    return {"status": "reviewed", "files_reviewed": len(code_reviews)}
