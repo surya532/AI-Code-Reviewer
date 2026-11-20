@@ -43,16 +43,21 @@ It provides suggestions for code optimizations, detects missing tests, and ident
 
 ## Getting started
 
+Requires Docker.
+
 ```bash
 git clone https://github.com/surya532/AI-Code-Reviewer.git
 cd AI-Code-Reviewer
-cp .env.example .env        # then fill in the values below
-docker compose up --build
+cp .env.example .env        # then add your keys
+docker compose up --build   # API on http://localhost:8000
 ```
 
 ### Configuration
+Set these in `.env`:
+
 | Variable | Purpose |
 |---|---|
+| `GITHUB_TOKEN` | Token allowed to read pull requests and post comments |
 | `OPENAI_API_KEY` | OpenAI API key |
-| `GITHUB_TOKEN` | Token allowed to read PRs and post comments |
-| `DATABASE_URL` | PostgreSQL connection string |
+
+Docker Compose sets `DATABASE_URL` for the bundled PostgreSQL container. The credentials in `docker-compose.yml` are for local development only; don't reuse them anywhere else.
