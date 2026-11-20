@@ -39,3 +39,20 @@ It provides suggestions for code optimizations, detects missing tests, and ident
              |
              v
    [GitHub PR Comments]       <---- Post review suggestions
+```
+
+## Getting started
+
+```bash
+git clone https://github.com/surya532/AI-Code-Reviewer.git
+cd AI-Code-Reviewer
+cp .env.example .env        # then fill in the values below
+docker compose up --build
+```
+
+### Configuration
+| Variable | Purpose |
+|---|---|
+| `OPENAI_API_KEY` | OpenAI API key |
+| `GITHUB_TOKEN` | Token allowed to read PRs and post comments |
+| `DATABASE_URL` | PostgreSQL connection string |
