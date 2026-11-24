@@ -1,8 +1,10 @@
-import asyncio
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Depends
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+
 from .db import Base, engine, get_db
 from .models import Review
 from .github import get_pr_files, post_pr_comment
@@ -13,18 +15,15 @@ from .security import require_github_signature
 
 logger = logging.getLogger(__name__)
 
-Base.metadata.create_all(bind=engine)
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Tables are created at startup, not at import, so importing this module (e.g. in tests) needs no database.
+    Base.metadata.create_all(bind=engine)
+    yield
 
-# Keep references to fire-and-forget tasks so they are not garbage-collected mid-flight.
-_background_tasks: set = set()
 
-
-def _on_task_done(task: asyncio.Task) -> None:
-    _background_tasks.discard(task)
-    if not task.cancelled() and task.exception() is not None:
-        logger.error("Failed to post PR comment", exc_info=task.exception())
+app = FastAPI(lifespan=lifespan)
 
 
 @app.post("/webhook/github", dependencies=[Depends(require_github_signature)])
@@ -38,6 +37,16 @@ async def github_webhook(request: Request, db: Session = Depends(get_db)):
     pr_number = payload["pull_request"]["number"]
     repo_full_name = payload["repository"]["full_name"]
     branch = payload["pull_request"]["head"]["ref"]
+    head_sha = payload["pull_request"]["head"]["sha"]
+
+    # Already reviewed and commented for this exact commit? Do nothing (saves OpenAI cost, avoids duplicate comments).
+    review_entry = (
+        db.query(Review)
+        .filter_by(repo=repo_full_name, pr_number=pr_number, head_sha=head_sha)
+        .first()
+    )
+    if review_entry and review_entry.status == "completed":
+        return {"status": "duplicate", "review_id": review_entry.id}
 
     # Rate limit
     try:
@@ -62,39 +71,53 @@ async def github_webhook(request: Request, db: Session = Depends(get_db)):
         if not patch:
             continue
 
-        # Generate language-aware prompt
         prompt = generate_language_prompt(language, patch)
-
-        # Send prompt to OpenAI for review
-        review_text = review_code_with_llm(prompt)
+        review_text = await review_code_with_llm(prompt)
 
         code_reviews.append({
             "file": filename,
             "language": language,
-            "comments": review_text
+            "comments": review_text,
         })
 
     if not code_reviews:
         return {"status": "no_supported_files"}
 
-    # Save to DB
-    review_entry = Review(
-        repo=repo_full_name,
-        pr_number=pr_number,
-        branch=branch,
-        status="completed",
-        review={"comments": code_reviews}
-    )
-    db.add(review_entry)
-    db.commit()
+    # Save the review (or reuse the row from an earlier attempt whose comment failed to post)
+    if review_entry is None:
+        review_entry = Review(
+            repo=repo_full_name,
+            pr_number=pr_number,
+            head_sha=head_sha,
+            branch=branch,
+            status="reviewed",
+            review={"comments": code_reviews},
+        )
+        db.add(review_entry)
+    else:
+        review_entry.review = {"comments": code_reviews}
+        review_entry.status = "reviewed"
+
+    try:
+        db.commit()
+    except IntegrityError:
+        # A concurrent delivery for the same commit won the race.
+        db.rollback()
+        return {"status": "duplicate"}
     db.refresh(review_entry)
 
-    # Post summary comment
+    # Post summary comment; only mark the review completed once GitHub accepted it
     summary = "\n\n".join(
         [f"### {r['file']} ({r['language']})\n{r['comments']}" for r in code_reviews]
     )
-    task = asyncio.create_task(post_pr_comment(repo_full_name, pr_number, summary))
-    _background_tasks.add(task)
-    task.add_done_callback(_on_task_done)
+    try:
+        await post_pr_comment(repo_full_name, pr_number, summary)
+    except Exception:
+        logger.exception("Failed to post PR comment for %s#%s", repo_full_name, pr_number)
+        review_entry.status = "post_failed"
+        db.commit()
+        return {"status": "post_failed", "review_id": review_entry.id}
 
+    review_entry.status = "completed"
+    db.commit()
     return {"status": "reviewed", "files_reviewed": len(code_reviews)}
