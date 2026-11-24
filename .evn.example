@@ -1,0 +1,5 @@
+# Copy to .env and fill in. Never commit .env.
+GITHUB_TOKEN=your_github_token_here
+OPENAI_API_KEY=your_openai_key_here
+# Any long random string. Must match the secret you set on the GitHub webhook.
+GITHUB_WEBHOOK_SECRET=generate_with_openssl_rand_hex_32
