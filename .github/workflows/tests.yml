@@ -9,3 +9,5 @@ jobs:
         with: { python-version: "3.11" }
       - run: pip install -r requirements-dev.txt
       - run: pytest -q
+        env:
+          DATABASE_URL: sqlite://
