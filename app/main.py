@@ -1,3 +1,6 @@
+import asyncio
+import logging
+
 from fastapi import FastAPI, Request, Depends
 from sqlalchemy.orm import Session
 from .db import Base, engine, get_db
@@ -6,13 +9,25 @@ from .github import get_pr_files, post_pr_comment
 from .reviewer import review_code_with_llm
 from .rate_limit import check_rate_limit
 from .language_utils import detect_language, generate_language_prompt
-import asyncio
+from .security import require_github_signature
+
+logger = logging.getLogger(__name__)
 
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
 
-@app.post("/webhook/github")
+# Keep references to fire-and-forget tasks so they are not garbage-collected mid-flight.
+_background_tasks: set = set()
+
+
+def _on_task_done(task: asyncio.Task) -> None:
+    _background_tasks.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        logger.error("Failed to post PR comment", exc_info=task.exception())
+
+
+@app.post("/webhook/github", dependencies=[Depends(require_github_signature)])
 async def github_webhook(request: Request, db: Session = Depends(get_db)):
     payload = await request.json()
     action = payload.get("action")
@@ -78,6 +93,8 @@ async def github_webhook(request: Request, db: Session = Depends(get_db)):
     summary = "\n\n".join(
         [f"### {r['file']} ({r['language']})\n{r['comments']}" for r in code_reviews]
     )
-    asyncio.create_task(post_pr_comment(repo_full_name, pr_number, summary))
+    task = asyncio.create_task(post_pr_comment(repo_full_name, pr_number, summary))
+    _background_tasks.add(task)
+    task.add_done_callback(_on_task_done)
 
     return {"status": "reviewed", "files_reviewed": len(code_reviews)}
