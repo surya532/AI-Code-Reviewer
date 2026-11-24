@@ -3,10 +3,31 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
 from app import main
-from app.db import Base, engine, SessionLocal
+from app.db import Base, get_db
 from app.models import Review
 from app.security import compute_signature
+
+# The tests use their own in-memory SQLite database, so they never touch Postgres.
+engine = create_engine(
+    "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+
+def override_get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+main.app.dependency_overrides[get_db] = override_get_db
 
 SECRET = "test-secret"
 client = TestClient(main.app)
