@@ -3,5 +3,7 @@ uvicorn[standard]
 httpx
 sqlalchemy
 psycopg2-binary
-openai
 python-dotenv
+psycopg[binary]
+redis
+openai>=1.0
