@@ -10,6 +10,7 @@ from sqlalchemy.pool import StaticPool
 from app import main
 from app.db import Base, get_db
 from app.models import Review
+from app.rate_limit import RateLimitExceeded, RateLimiterUnavailable
 from app.security import compute_signature
 
 # The tests use their own in-memory SQLite database, so they never touch Postgres.
@@ -69,6 +70,8 @@ def setup(monkeypatch):
             raise RuntimeError("github down")
         state["comments"].append(body)
 
+    # No Redis in tests: the rate limiter is replaced by a no-op (a test below makes it raise).
+    monkeypatch.setattr(main, "check_rate_limit", lambda repo: None)
     monkeypatch.setattr(main, "get_pr_files", fake_files)
     monkeypatch.setattr(main, "review_code_with_llm", fake_llm)
     monkeypatch.setattr(main, "post_pr_comment", fake_post)
@@ -116,3 +119,26 @@ def test_failed_comment_can_be_retried_without_a_second_row(setup):
     assert len(setup["comments"]) == 1
     with SessionLocal() as db:
         assert db.query(Review).count() == 1
+
+
+def test_rate_limited_request_does_no_work(setup, monkeypatch):
+    def limited(repo):
+        raise RateLimitExceeded("too many requests")
+
+    monkeypatch.setattr(main, "check_rate_limit", limited)
+    r = post(pr_payload())
+    assert r.status_code == 429
+    assert r.json()["status"] == "rate_limited"
+    assert setup["llm_calls"] == 0
+    assert setup["comments"] == []
+
+
+def test_redis_outage_fails_closed_without_spending_money(setup, monkeypatch):
+    def down(repo):
+        raise RateLimiterUnavailable("redis down")
+
+    monkeypatch.setattr(main, "check_rate_limit", down)
+    r = post(pr_payload())
+    assert r.status_code == 503
+    assert r.json() == {"status": "rate_limiter_unavailable"}
+    assert setup["llm_calls"] == 0
