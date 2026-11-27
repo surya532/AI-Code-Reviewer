@@ -1,5 +1,6 @@
 import json
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -56,10 +57,18 @@ def setup(monkeypatch):
     Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)
 
-    state = {"llm_calls": 0, "comments": [], "fail_post": False}
+    state = {
+        "llm_calls": 0,
+        "comments": [],
+        "fail_post": False,
+        "files": [{"filename": "app.py", "status": "modified", "patch": "+print('hi')"}],
+        "files_error": False,
+    }
 
     async def fake_files(repo, pr):
-        return [{"filename": "app.py", "status": "modified", "patch": "+print('hi')"}]
+        if state["files_error"]:
+            raise httpx.ConnectError("github down")
+        return state["files"]
 
     async def fake_llm(prompt):
         state["llm_calls"] += 1
@@ -141,4 +150,42 @@ def test_redis_outage_fails_closed_without_spending_money(setup, monkeypatch):
     r = post(pr_payload())
     assert r.status_code == 503
     assert r.json() == {"status": "rate_limiter_unavailable"}
+    assert setup["llm_calls"] == 0
+
+
+def test_github_failure_while_fetching_files_returns_502(setup):
+    setup["files_error"] = True
+    r = post(pr_payload())
+    assert r.status_code == 502
+    assert r.json() == {"status": "github_error"}
+    assert setup["llm_calls"] == 0
+
+
+def test_oversized_diff_is_skipped_and_reported(setup):
+    setup["files"] = [
+        {"filename": "small.py", "status": "modified", "patch": "+x = 1"},
+        {"filename": "huge.py", "status": "modified", "patch": "+" + "x" * (main.MAX_PATCH_CHARS + 1)},
+    ]
+    r = post(pr_payload())
+    assert r.json() == {"status": "reviewed", "files_reviewed": 1}
+    assert setup["llm_calls"] == 1
+    assert "huge.py (diff too large)" in setup["comments"][0]
+
+
+def test_file_limit_caps_openai_calls(setup, monkeypatch):
+    monkeypatch.setattr(main, "MAX_FILES_REVIEWED", 2)
+    setup["files"] = [
+        {"filename": f"f{i}.py", "status": "modified", "patch": "+x = 1"} for i in range(5)
+    ]
+    post(pr_payload())
+    assert setup["llm_calls"] == 2
+    assert "file limit of 2 reached" in setup["comments"][0]
+
+
+def test_unsupported_and_removed_files_are_never_sent_to_the_model(setup):
+    setup["files"] = [
+        {"filename": "README.md", "status": "modified", "patch": "+docs"},
+        {"filename": "old.py", "status": "removed", "patch": "-gone"},
+    ]
+    assert post(pr_payload()).json() == {"status": "no_supported_files"}
     assert setup["llm_calls"] == 0
