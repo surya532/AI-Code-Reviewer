@@ -2,6 +2,7 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Depends
+from fastapi.responses import JSONResponse
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -9,7 +10,7 @@ from .db import Base, engine, get_db
 from .models import Review
 from .github import get_pr_files, post_pr_comment
 from .reviewer import review_code_with_llm
-from .rate_limit import check_rate_limit
+from .rate_limit import check_rate_limit, RateLimitExceeded, RateLimiterUnavailable
 from .language_utils import detect_language, generate_language_prompt
 from .security import require_github_signature
 
@@ -51,8 +52,12 @@ async def github_webhook(request: Request, db: Session = Depends(get_db)):
     # Rate limit
     try:
         check_rate_limit(repo_full_name)
-    except Exception as e:
-        return {"status": "rate_limited", "message": str(e)}
+    except RateLimitExceeded as e:
+        return JSONResponse(status_code=429, content={"status": "rate_limited", "message": str(e)})
+    except RateLimiterUnavailable:
+        # Fail closed: every review costs money, so do not review without a working limiter.
+        logger.exception("Rate limiter unavailable; not reviewing %s#%s", repo_full_name, pr_number)
+        return JSONResponse(status_code=503, content={"status": "rate_limiter_unavailable"})
 
     # Fetch PR files
     files = await get_pr_files(repo_full_name, pr_number)
