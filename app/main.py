@@ -1,6 +1,7 @@
 import logging
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import FastAPI, Request, Depends
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import IntegrityError
@@ -25,6 +26,10 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+# Cost guards: one huge pull request must not run up an OpenAI bill.
+MAX_FILES_REVIEWED = 20
+MAX_PATCH_CHARS = 20_000
 
 
 @app.post("/webhook/github", dependencies=[Depends(require_github_signature)])
@@ -60,8 +65,13 @@ async def github_webhook(request: Request, db: Session = Depends(get_db)):
         return JSONResponse(status_code=503, content={"status": "rate_limiter_unavailable"})
 
     # Fetch PR files
-    files = await get_pr_files(repo_full_name, pr_number)
+    try:
+        files = await get_pr_files(repo_full_name, pr_number)
+    except httpx.HTTPError:
+        logger.exception("Could not fetch files for %s#%s", repo_full_name, pr_number)
+        return JSONResponse(status_code=502, content={"status": "github_error"})
     code_reviews = []
+    skipped = []
 
     for f in files:
         filename = f["filename"]
@@ -74,6 +84,13 @@ async def github_webhook(request: Request, db: Session = Depends(get_db)):
 
         patch = f.get("patch")
         if not patch:
+            continue
+
+        if len(code_reviews) >= MAX_FILES_REVIEWED:
+            skipped.append(f"{filename} (file limit of {MAX_FILES_REVIEWED} reached)")
+            continue
+        if len(patch) > MAX_PATCH_CHARS:
+            skipped.append(f"{filename} (diff too large)")
             continue
 
         prompt = generate_language_prompt(language, patch)
@@ -115,6 +132,8 @@ async def github_webhook(request: Request, db: Session = Depends(get_db)):
     summary = "\n\n".join(
         [f"### {r['file']} ({r['language']})\n{r['comments']}" for r in code_reviews]
     )
+    if skipped:
+        summary += "\n\n### Not reviewed\n" + "\n".join(f"- {s}" for s in skipped)
     try:
         await post_pr_comment(repo_full_name, pr_number, summary)
     except Exception:
